@@ -1,6 +1,6 @@
-import { parseStringPromise } from 'xml2js';
+// --- minimal, zero-dependency YouTube transcript fetcher with debug ---
 
-// ---------- helpers ----------
+// URL → videoId
 function getVideoId(input) {
   try {
     const u = new URL(input);
@@ -17,40 +17,64 @@ function getVideoId(input) {
   const mm = String(input).match(rx);
   return mm ? mm[1] : null;
 }
-const norm = (s) => (s || '').toLowerCase();
-const base = (s) => norm(s).split('-')[0];
+
 const UA_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
   'Accept-Language': 'en,en-US;q=0.9'
 };
-function buildQuery(params) {
+
+const norm = (s) => (s || '').toLowerCase();
+const base = (s) => norm(s).split('-')[0];
+
+function q(params) {
   return Object.entries(params)
     .filter(([_, v]) => v !== undefined && v !== null && String(v).length > 0)
     .map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(String(v)))
     .join('&');
 }
+
 async function fetchText(url) {
   const r = await fetch(url, { headers: UA_HEADERS, redirect: 'follow' });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return await r.text();
 }
 
-// ---------- caption helpers ----------
-async function listTracks(videoId) {
-  const url = 'https://www.youtube.com/api/timedtext?' + buildQuery({ type: 'list', v: videoId });
-  const xml = await fetchText(url).catch(() => '');
-  if (!xml || !xml.includes('<transcript_list')) return [];
-  const parsed = await parseStringPromise(xml).catch(() => null);
-  const tracks = parsed?.transcript_list?.track || [];
-  return tracks.map(t => ({
-    lang_code: t.$?.lang_code || '',
-    kind:      t.$?.kind || '',
-    name:      t.$?.name || ''
-  }));
+// ---------- Track listing (regex-based) ----------
+function parseTrackListXML(xml) {
+  // returns [{lang_code, kind, name}]
+  const tracks = [];
+  if (!xml || !xml.includes('<transcript_list')) return tracks;
+
+  // match <track ... />
+  const tagRe = /<track\b([^>]*)\/>/g;
+  let m;
+  while ((m = tagRe.exec(xml)) !== null) {
+    const attrs = m[1] || '';
+    const attrMap = {};
+    // key="value"
+    const attrRe = /(\w+)="([^"]*)"/g;
+    let a;
+    while ((a = attrRe.exec(attrs)) !== null) {
+      attrMap[a[1]] = a[2];
+    }
+    tracks.push({
+      lang_code: attrMap.lang_code || '',
+      kind: attrMap.kind || '',
+      name: attrMap.name || ''
+    });
+  }
+  return tracks;
 }
 
+async function listTracks(videoId) {
+  const url = 'https://www.youtube.com/api/timedtext?' + q({ type: 'list', v: videoId });
+  const xml = await fetchText(url).catch(() => '');
+  return parseTrackListXML(xml);
+}
+
+// ---------- Timedtext fetchers ----------
 async function timedtextJson3(params) {
-  const u = 'https://www.youtube.com/api/timedtext?' + buildQuery({ ...params, fmt: 'json3' });
+  const u = 'https://www.youtube.com/api/timedtext?' + q({ ...params, fmt: 'json3' });
   try {
     const body = await fetchText(u);
     if (!body || body.trim().startsWith('<')) return '';
@@ -64,26 +88,28 @@ async function timedtextJson3(params) {
     return parts.join(' ').replace(/\s+/g, ' ').trim();
   } catch { return ''; }
 }
+
 async function timedtextXml(params) {
-  const u = 'https://www.youtube.com/api/timedtext?' + buildQuery(params);
+  const u = 'https://www.youtube.com/api/timedtext?' + q(params);
   try {
     const body = await fetchText(u);
     if (!body || !body.includes('<transcript')) return '';
-    const textNodes = Array.from(body.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)).map(m => m[1]);
-    const decoded = textNodes
-      .map(t => t
-        .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10) || 0))
-        .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCharCode(parseInt(h, 16) || 0)));
+    const texts = Array.from(body.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)).map(m => m[1]);
+    const decoded = texts.map(t => t
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10) || 0))
+      .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCharCode(parseInt(h, 16) || 0))
+    );
     return decoded.join(' ').replace(/\s+/g, ' ').trim();
   } catch { return ''; }
 }
+
 async function timedtextVtt(params) {
-  const u = 'https://www.youtube.com/api/timedtext?' + buildQuery({ ...params, fmt: 'vtt' });
+  const u = 'https://www.youtube.com/api/timedtext?' + q({ ...params, fmt: 'vtt' });
   try {
     const body = await fetchText(u);
     if (!body || !body.includes('WEBVTT')) return '';
@@ -148,7 +174,6 @@ async function smartFetch(videoId, preferredLang) {
   return { text: '', tracks };
 }
 
-// ---------- handler ----------
 export default async function handler(req, res) {
   try {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -167,7 +192,6 @@ export default async function handler(req, res) {
     }
 
     if (debug === '1') {
-      // Always return track info in debug mode
       return res.status(result.text ? 200 : 404).json({
         ...(result.text ? { text: result.text } : { error: 'No transcript available' }),
         tracks: result.tracks,
