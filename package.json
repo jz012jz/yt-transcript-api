@@ -4,6 +4,6 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "youtube-transcript": "latest"
+    "xml2js": "^0.6.2"
   }
 }
